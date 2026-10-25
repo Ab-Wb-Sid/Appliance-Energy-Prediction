@@ -3,13 +3,33 @@ import pickle
 
 import pandas as pd
 import streamlit as st
+from huggingface_hub import hf_hub_download
 
 st.set_page_config(page_title="Appliances Energy Prediction", page_icon="⚡", layout="wide")
 
+# ---- Model location on Hugging Face (change here if it ever moves) ----
+HF_REPO_ID = "AbWbSid/appliance-energy-model"
+HF_MODEL_FILENAME = "energy_model_full_dataset.pkl"
 
-@st.cache_resource
+
+def _get_hf_token():
+    """Optional token for a PRIVATE repo, read from Streamlit Secrets (HF_TOKEN).
+    The repo is public, so normally this returns None and no token is used."""
+    try:
+        return st.secrets.get("HF_TOKEN") or None
+    except Exception:
+        return None
+
+
+@st.cache_resource(show_spinner="Downloading the model from Hugging Face (first run only)...")
 def load_model():
-    with open("energy_model_full_dataset.pkl", "rb") as f:
+    # hf_hub_download stores the file in the local Hugging Face cache and reuses it afterwards.
+    model_path = hf_hub_download(
+        repo_id=HF_REPO_ID,
+        filename=HF_MODEL_FILENAME,
+        token=_get_hf_token(),
+    )
+    with open(model_path, "rb") as f:
         return pickle.load(f)
 
 
@@ -19,8 +39,40 @@ def load_info():
         return json.load(f)
 
 
-model = load_model()
-info = load_info()
+try:
+    info = load_info()
+except FileNotFoundError:
+    st.error("`model_info.json` was not found. It must be in the same GitHub folder as `app.py`.")
+    st.stop()
+except json.JSONDecodeError as e:
+    st.error(f"`model_info.json` is not valid JSON: {e}")
+    st.stop()
+
+try:
+    model = load_model()
+except Exception as e:
+    name = type(e).__name__
+    if name in ("RepositoryNotFoundError", "GatedRepoError"):
+        st.error(
+            f"Could not access the Hugging Face repository `{HF_REPO_ID}`. Check that it exists and "
+            "is public. If it is private, add `HF_TOKEN` to the app's Streamlit Secrets."
+        )
+    elif name in ("EntryNotFoundError", "RemoteEntryNotFoundError"):
+        st.error(f"The file `{HF_MODEL_FILENAME}` was not found in `{HF_REPO_ID}`. Check the exact filename.")
+    elif name in ("LocalEntryNotFoundError", "ConnectionError", "Timeout", "ReadTimeout", "ConnectTimeout"):
+        st.error("Could not reach Hugging Face to download the model. Check the connection and reload the page.")
+    elif isinstance(e, (pickle.UnpicklingError, ModuleNotFoundError, AttributeError, ImportError, EOFError)):
+        st.error(
+            "The model file was downloaded but could not be loaded. This is usually a scikit-learn "
+            "version mismatch: install the same version that was used to train and save the model "
+            "(see `requirements.txt`)."
+        )
+    else:
+        st.error(f"Unexpected error while loading the model ({name}).")
+    with st.expander("Technical details"):
+        st.code(f"{name}: {e}")
+    st.stop()
+
 stats = info["stats"]
 
 st.title("⚡ Appliances Energy Prediction System")
@@ -74,7 +126,16 @@ with c3:
 
 if st.button("Predict Energy Use", type="primary"):
     feature_vector = pd.DataFrame([values])[info["numeric_features"] + info["categorical_features"]]
-    prediction = float(model.predict(feature_vector)[0])
+    try:
+        prediction = float(model.predict(feature_vector)[0])
+    except Exception as e:
+        st.error(
+            "The model could not make a prediction. The input columns may not match what the model "
+            "was trained on, or the scikit-learn version may differ."
+        )
+        with st.expander("Technical details"):
+            st.code(f"{type(e).__name__}: {e}")
+        st.stop()
     prediction = max(prediction, 0.0)
 
     a, b = st.columns(2)
